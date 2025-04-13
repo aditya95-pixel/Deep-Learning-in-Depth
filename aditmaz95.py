@@ -1,6 +1,9 @@
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
+import torchvision
+from torchvision import transforms
 import matplotlib.pyplot as plt
 from matplotlib_inline import backend_inline
 import inspect
@@ -369,3 +372,91 @@ class WeightDecay(LinearRegression):
         return torch.optim.SGD([
             {"params":self.net.weight,"weight_decay":self.wd},
             {"params":self.net.bias}],lr=self.lr)
+    
+def show_images(imgs, num_rows, num_cols, titles=None, scale=1.5):
+    figsize = (num_cols * scale, num_rows * scale)
+    _, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
+    axes = axes.flatten()
+    for i, (ax, img) in enumerate(zip(axes, imgs)):
+        ax.imshow(img, cmap='gray')
+        ax.axes.get_xaxis().set_visible(False)
+        ax.axes.get_yaxis().set_visible(False)
+        if titles:
+            ax.set_title(titles[i])
+    plt.show()
+
+class FashionMNIST(DataModule):
+    def __init__(self,batch_size=64,resize=(28,28)):
+        super().__init__()
+        self.save_hyperparameters()
+        trans=transforms.Compose([transforms.Resize(resize),transforms.ToTensor()])
+        self.train=torchvision.datasets.FashionMNIST(
+            root=self.root,train=True,transform=trans,download=True)
+        self.val=torchvision.datasets.FashionMNIST(
+            root=self.root,train=True,transform=trans,download=True)
+    def text_labels(self,indices):
+        labels = ['t-shirt', 'trouser', 'pullover', 'dress', 'coat',
+              'sandal', 'shirt', 'sneaker', 'bag', 'ankle boot']
+        return [labels[int(i)] for i in indices]
+    def get_dataloader(self, train):
+        data=self.train if train else self.val
+        return torch.utils.data.DataLoader(
+            data,self.batch_size,shuffle=train,
+            num_workers=self.num_workers
+        ) 
+    def visualize(self,batch,nrows=1,ncols=8,labels=[]):
+        X,y=batch
+        if not labels:
+            labels=self.text_labels(y)
+        show_images(X.squeeze(1), nrows, ncols, titles=labels)
+
+class Classifier(Module):
+    def validation_step(self, batch):
+        Y_hat = self(*batch[:-1])
+        self.plot('loss', self.loss(Y_hat, batch[-1]), train=False)
+        self.plot('acc', self.accuracy(Y_hat, batch[-1]), train=False)
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(), lr=self.lr)
+    def accuracy(self, Y_hat, Y, averaged=True):
+        Y_hat = Y_hat.reshape((-1, Y_hat.shape[-1]))
+        preds = Y_hat.argmax(axis=1).type(Y.dtype)
+        compare = (preds == Y.reshape(-1)).type(torch.float32)
+        return compare.mean() if averaged else compare
+    
+def softmax(X):
+    X_exp = torch.exp(X)
+    partition = X_exp.sum(1, keepdims=True)
+    return X_exp / partition
+
+def cross_entropy(y_hat, y):
+    return -torch.log(y_hat[list(range(len(y_hat))), y]).mean()
+
+class SoftmaxRegressionScratch(Classifier):
+    def __init__(self, num_inputs, num_outputs, lr, sigma=0.01):
+        super().__init__()
+        self.save_hyperparameters()
+        self.W = torch.normal(0, sigma, size=(num_inputs, num_outputs),
+                              requires_grad=True)
+        self.b = torch.zeros(num_outputs, requires_grad=True)
+    def parameters(self):
+        return [self.W, self.b]
+    def forward(self, X):
+        X = X.reshape((-1, self.W.shape[0]))
+        return softmax(torch.matmul(X, self.W) + self.b)
+    def loss(self, y_hat, y):
+        return cross_entropy(y_hat, y)
+
+class SoftmaxRegression(Classifier):  
+    def __init__(self, num_outputs, lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.net = nn.Sequential(nn.Flatten(),
+                                 nn.LazyLinear(num_outputs))
+
+    def forward(self, X):
+        return self.net(X)
+    def loss(self, Y_hat, Y, averaged=True):
+        Y_hat = Y_hat.reshape((-1, Y_hat.shape[-1]))
+        Y = Y.reshape((-1,))
+        return F.cross_entropy(
+            Y_hat, Y, reduction='mean' if averaged else 'none')
