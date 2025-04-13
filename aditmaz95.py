@@ -8,7 +8,11 @@ import matplotlib.pyplot as plt
 from matplotlib_inline import backend_inline
 import inspect
 import collections
+import pandas as pd
 from IPython import display
+import os
+import requests
+import hashlib
 
 def use_svg_display():
     backend_inline.set_matplotlib_formats('svg')
@@ -460,3 +464,157 @@ class SoftmaxRegression(Classifier):
         Y = Y.reshape((-1,))
         return F.cross_entropy(
             Y_hat, Y, reduction='mean' if averaged else 'none')
+
+def relu(X):
+    a = torch.zeros_like(X)
+    return torch.max(X, a)
+
+class MLPScratch(Classifier):
+    def __init__(self, num_inputs, num_outputs, num_hiddens, lr, sigma=0.01):
+        super().__init__()
+        self.save_hyperparameters()
+        self.W1 = nn.Parameter(torch.randn(num_inputs, num_hiddens) * sigma)
+        self.b1 = nn.Parameter(torch.zeros(num_hiddens))
+        self.W2 = nn.Parameter(torch.randn(num_hiddens, num_outputs) * sigma)
+        self.b2 = nn.Parameter(torch.zeros(num_outputs))
+    def forward(self, X):
+        X = X.reshape((-1, self.num_inputs))
+        H = relu(torch.matmul(X, self.W1) + self.b1)
+        return torch.matmul(H, self.W2) + self.b2
+    def loss(self, y_hat, y):
+        return cross_entropy(y_hat, y)
+
+class MLP(Classifier):
+    def __init__(self, num_outputs, num_hiddens, lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.net = nn.Sequential(nn.Flatten(), nn.LazyLinear(num_hiddens),
+                                 nn.ReLU(), nn.LazyLinear(num_outputs))
+    def loss(self, Y_hat, Y, averaged=True):
+        Y_hat = Y_hat.reshape((-1, Y_hat.shape[-1]))
+        Y = Y.reshape((-1,))
+        return F.cross_entropy(
+            Y_hat, Y, reduction='mean' if averaged else 'none')
+
+def dropout_layer(X, dropout):
+    assert 0 <= dropout <= 1
+    if dropout == 1: return torch.zeros_like(X)
+    mask = (torch.rand(X.shape) > dropout).float()
+    return mask * X / (1.0 - dropout)
+
+class DropoutMLPScratch(Classifier):
+    def __init__(self, num_outputs, num_hiddens_1, num_hiddens_2,
+                 dropout_1, dropout_2, lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.lin1 = nn.LazyLinear(num_hiddens_1)
+        self.lin2 = nn.LazyLinear(num_hiddens_2)
+        self.lin3 = nn.LazyLinear(num_outputs)
+        self.relu = nn.ReLU()
+
+    def forward(self, X):
+        H1 = self.relu(self.lin1(X.reshape((X.shape[0], -1))))
+        if self.training:
+            H1 = dropout_layer(H1, self.dropout_1)
+        H2 = self.relu(self.lin2(H1))
+        if self.training:
+            H2 = dropout_layer(H2, self.dropout_2)
+        return self.lin3(H2)
+    
+    def loss(self, y_hat, y):
+        return cross_entropy(y_hat, y)
+
+
+class DropoutMLP(Classifier):
+    def __init__(self, num_outputs, num_hiddens_1, num_hiddens_2,
+                 dropout_1, dropout_2, lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.net = nn.Sequential(
+            nn.Flatten(), nn.LazyLinear(num_hiddens_1), nn.ReLU(),
+            nn.Dropout(dropout_1), nn.LazyLinear(num_hiddens_2), nn.ReLU(),
+            nn.Dropout(dropout_2), nn.LazyLinear(num_outputs))
+    def loss(self, Y_hat, Y, averaged=True):
+        Y_hat = Y_hat.reshape((-1, Y_hat.shape[-1]))
+        Y = Y.reshape((-1,))
+        return F.cross_entropy(
+            Y_hat, Y, reduction='mean' if averaged else 'none')
+
+def download(url, path, sha1_hash=None):
+    os.makedirs(path, exist_ok=True)
+    fname = os.path.join(path, os.path.basename(url))
+    if os.path.exists(fname):
+        if sha1_hash:
+            with open(fname, 'rb') as f:
+                return fname if hashlib.sha1(f.read()).hexdigest() == sha1_hash else None
+        else:
+            return fname
+    print(f'Downloading {url} to {fname}...')
+    r = requests.get(url, stream=True, verify=True)
+    with open(fname, 'wb') as f:
+        for chunk in r.iter_content(chunk_size=1024):
+            if chunk:
+                f.write(chunk)
+    if sha1_hash:
+        with open(fname, 'rb') as f:
+            assert hashlib.sha1(f.read()).hexdigest() == sha1_hash
+    return fname
+
+
+
+class KaggleHouse(DataModule):
+    def __init__(self, batch_size, train=None, val=None):
+        super().__init__()
+        self.save_hyperparameters()
+        if self.train is None:
+            self.raw_train = pd.read_csv("kaggle house prices/train.csv")
+            self.raw_val = pd.read_csv("kaggle house prices/test.csv")
+    def preprocess(self):
+        # Remove the ID and label columns
+        label = 'SalePrice'
+        features = pd.concat(
+            (self.raw_train.drop(columns=['Id', label]),
+            self.raw_val.drop(columns=['Id'])))
+        # Standardize numerical columns
+        numeric_features = features.dtypes[features.dtypes!='object'].index
+        features[numeric_features] = features[numeric_features].apply(
+            lambda x: (x - x.mean()) / (x.std()))
+        # Replace NAN numerical features by 0
+        features[numeric_features] = features[numeric_features].fillna(0)
+        # Replace discrete features by one-hot encoding
+        features = pd.get_dummies(features, dummy_na=True)
+        # Save preprocessed features
+        self.train = features[:self.raw_train.shape[0]].copy()
+        self.train[label] = self.raw_train[label]
+        self.val = features[self.raw_train.shape[0]:].copy()
+    def get_dataloader(self, train):
+        label = 'SalePrice'
+        data = self.train if train else self.val
+        if label not in data: return
+        get_tensor = lambda x: torch.tensor(x.values.astype(float),
+                                        dtype=torch.float32)
+        # Logarithm of prices
+        tensors = (get_tensor(data.drop(columns=[label])),  # X
+                torch.log(get_tensor(data[label])).reshape((-1, 1)))  # Y
+        return self.get_tensorloader(tensors, train)
+
+def k_fold_data(data, k):
+    rets = []
+    fold_size = data.train.shape[0] // k
+    for j in range(k):
+        idx = range(j * fold_size, (j+1) * fold_size)
+        rets.append(KaggleHouse(data.batch_size, data.train.drop(index=idx),
+                                data.train.loc[idx]))
+    return rets
+
+def k_fold(trainer, data, k, lr):
+    val_loss, models = [], []
+    for i, data_fold in enumerate(k_fold_data(data, k)):
+        model = LinearRegression(lr)
+        model.board.yscale='log'
+        if i != 0: model.board.display = False
+        trainer.fit(model, data_fold)
+        val_loss.append(float(model.board.data['val_loss'][-1].y))
+        models.append(model)
+    print(f'average validation log mse = {sum(val_loss)/len(val_loss)}')
+    return models
