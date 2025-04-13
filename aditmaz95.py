@@ -148,10 +148,7 @@ class Module(nn.Module,HyperParameters):
             x = self.trainer.epoch + 1
             n = self.trainer.num_val_batches / \
                 self.plot_valid_per_epoch
-        self.board.draw(x, torch.numpy(torch.to(value,torch.cpu())),
-                        ('train_' if train else 'val_') + key,
-                        every_n=int(n))
-
+        self.board.draw(x, value.detach().cpu().numpy(), ('train_' if train else 'val_') + key, every_n=int(n))
 
     def training_step(self, batch):
         l = self.loss(self(*batch[:-1]), batch[-1])
@@ -209,7 +206,9 @@ class Trainer(HyperParameters):
     Defined in :numref:`subsec_oo-design-models`"""
     def __init__(self, max_epochs, num_gpus=0, gradient_clip_val=0):
         self.save_hyperparameters()
-        assert num_gpus == 0, 'No GPU support yet'
+        self.gpus = [torch.device(f"cuda:{i}") for i in range(min(num_gpus, torch.cuda.device_count()))]
+        assert not self.gpus or len(self.gpus) == 1, 'No multi-GPU support yet'
+
 
     def prepare_data(self, data):
         self.train_dataloader = data.train_dataloader()
@@ -234,10 +233,6 @@ class Trainer(HyperParameters):
         for self.epoch in range(self.max_epochs):
             self.fit_epoch()
 
-
-    def fit_epoch(self):
-        raise NotImplementedError
-
     def prepare_batch(self, batch):
         """Defined in :numref:`sec_linear_scratch`"""
         return batch
@@ -261,13 +256,6 @@ class Trainer(HyperParameters):
             with torch.no_grad():
                 self.model.validation_step(self.prepare_batch(batch))
             self.val_batch_idx += 1
-
-
-    def __init__(self, max_epochs, num_gpus=0, gradient_clip_val=0):
-        """Defined in :numref:`sec_use_gpu`"""
-        self.save_hyperparameters()
-        self.gpus = [torch.gpu(i) for i in range(min(num_gpus, torch.num_gpus()))]
-    
 
     def prepare_batch(self, batch):
         """Defined in :numref:`sec_use_gpu`"""
@@ -307,3 +295,77 @@ class SyntheticRegressionData(DataModule):
     def get_dataloader(self, train):
         i = slice(0, self.num_train) if train else slice(self.num_train, None)
         return self.get_tensorloader((self.X, self.y), train, i)
+
+class SGD(HyperParameters):
+    def __init__(self,params,lr):
+        self.save_hyperparameters()
+    def step(self):
+        for param in self.params:
+            param-=self.lr*param.grad
+    def zero_grad(self):
+        for param in self.params:
+            if param.grad is not None:
+                param.grad.zero_()
+
+class LinearRegressionScratch(Module):
+    def __init__(self,num_inputs,lr,sigma=0.01):
+        super().__init__()
+        self.save_hyperparameters()
+        self.w=torch.normal(0,sigma,(num_inputs,1),requires_grad=True)
+        self.b=torch.zeros(1,requires_grad=True)
+    def forward(self,X):
+        return torch.matmul(X,self.w)+self.b
+    def loss(self,y_hat,y):
+        l=(y_hat-y)**2/2
+        return l.mean()
+    def configure_optimizers(self):
+        return SGD([self.w,self.b],self.lr)
+
+class LinearRegression(Module):
+    def __init__(self,lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.net=nn.LazyLinear(1)
+        self.net.weight.data.normal_(0,0.01)
+        self.net.bias.data.fill_(0)
+    def forward(self, X):
+        return self.net(X)
+    def loss(self,y_hat,y):
+        fn=nn.MSELoss()
+        return fn(y_hat,y)
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(),self.lr)
+    def get_w_b(self):
+        return (self.net.weight.data,self.net.bias.data)
+    
+class Data(DataModule):
+    def __init__(self,num_train,num_val,num_inputs,batch_size):
+        self.save_hyperparameters()
+        n=num_train+num_val
+        self.X=torch.randn(n,num_inputs)
+        noise=torch.randn(n,1)*0.01
+        w,b=torch.ones((num_inputs,1))*0.01,0.05
+        self.y=torch.matmul(self.X,w)+b+noise
+    def get_dataloader(self, train):
+        i=slice(0,self.num_train) if train else slice(self.num_train,None)
+        return self.get_tensorloader([self.X,self.y],train,i)
+
+def l2_penalty(w):
+    return (w**2).sum()/2
+
+class WeightDecayScratch(LinearRegressionScratch):
+    def __init__(self,num_inputs,lambd,lr,sigma=0.01):
+        super().__init__(num_inputs,lr,sigma)
+        self.save_hyperparameters()
+    def loss(self,y_hat,y):
+        return (super().loss(y_hat,y)+self.lambd*l2_penalty(self.w)) 
+    
+class WeightDecay(LinearRegression):
+    def __init__(self,wd,lr):
+        super().__init__(lr)
+        self.save_hyperparameters()
+        self.wd=wd
+    def configure_optimizers(self):
+        return torch.optim.SGD([
+            {"params":self.net.weight,"weight_decay":self.wd},
+            {"params":self.net.bias}],lr=self.lr)
