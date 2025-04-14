@@ -267,7 +267,7 @@ class Trainer(HyperParameters):
     def prepare_batch(self, batch):
         """Defined in :numref:`sec_use_gpu`"""
         if self.gpus:
-            batch = [torch.to(a, self.gpus[0]) for a in batch]
+            batch = [a.to(self.gpus[0]) for a in batch]
         return batch
 
     
@@ -426,7 +426,12 @@ class Classifier(Module):
         preds = Y_hat.argmax(axis=1).type(Y.dtype)
         compare = (preds == Y.reshape(-1)).type(torch.float32)
         return compare.mean() if averaged else compare
-    
+    def layer_summary(self, X_shape):
+        X = torch.randn(*X_shape)
+        for layer in self.net:
+            X = layer(X)
+            print(layer.__class__.__name__, 'output shape:\t', X.shape)
+        
 def softmax(X):
     X_exp = torch.exp(X)
     partition = X_exp.sum(1, keepdims=True)
@@ -640,3 +645,46 @@ def try_gpu(i=0):
 def try_all_gpus():
     """Return all available GPUs, or [cpu(),] if no GPU exists."""
     return [gpu(i) for i in range(num_gpus())]
+
+def corr2d(X, K): 
+    """Compute 2D cross-correlation."""
+    h, w = K.shape
+    Y = torch.zeros((X.shape[0] - h + 1, X.shape[1] - w + 1))
+    for i in range(Y.shape[0]):
+        for j in range(Y.shape[1]):
+            Y[i, j] = (X[i:i + h, j:j + w] * K).sum()
+    return Y
+
+class Conv2D(nn.Module):
+    def __init__(self, kernel_size):
+        super().__init__()
+        self.weight = nn.Parameter(torch.rand(kernel_size))
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        return corr2d(x, self.weight) + self.bias
+    
+def init_cnn(module):  
+    """Initialize weights for CNNs."""
+    if type(module) == nn.Linear or type(module) == nn.Conv2d:
+        nn.init.xavier_uniform_(module.weight)
+
+class LeNet(Classifier):  
+    """The LeNet-5 model."""
+    def __init__(self, lr=0.1, num_classes=10):
+        super().__init__()
+        self.save_hyperparameters()
+        self.net = nn.Sequential(
+            nn.LazyConv2d(6, kernel_size=5, padding=2), nn.Sigmoid(),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            nn.LazyConv2d(16, kernel_size=5), nn.Sigmoid(),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            nn.Flatten(),
+            nn.LazyLinear(120), nn.Sigmoid(),
+            nn.LazyLinear(84), nn.Sigmoid(),
+            nn.LazyLinear(num_classes))
+    def loss(self, Y_hat, Y, averaged=True):
+        Y_hat = Y_hat.reshape((-1, Y_hat.shape[-1]))
+        Y = Y.reshape((-1,))
+        return F.cross_entropy(
+            Y_hat, Y, reduction='mean' if averaged else 'none')
