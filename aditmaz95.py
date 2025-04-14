@@ -567,8 +567,8 @@ class KaggleHouse(DataModule):
         super().__init__()
         self.save_hyperparameters()
         if self.train is None:
-            self.raw_train = pd.read_csv("kaggle house prices/train.csv")
-            self.raw_val = pd.read_csv("kaggle house prices/test.csv")
+            self.raw_train = pd.read_csv("kaggle_house_prices/train.csv")
+            self.raw_val = pd.read_csv("kaggle_house_prices/test.csv")
     def preprocess(self):
         # Remove the ID and label columns
         label = 'SalePrice'
